@@ -1,16 +1,17 @@
 """shapiq + probly mit VGG16: Welche Bildbereiche machen das Modell unsicher?
 
 Alles in einer Datei: das Spiel (``UnsicherheitsSpiel``), die Berechnung mit shapiq und die Ausgabe
-(``erklaere_unsicherheit``). Dropout und/oder Ensemble sind wählbar.
+(``erklaere_unsicherheit``). Dropout, DropConnect und/oder Ensemble sind wählbar.
 
     from image_uncertainty import erklaere_unsicherheit
     erklaere_unsicherheit("bild.jpg", methode="beide", raster=4, samples=5, p=0.2)   # TU, AU und EU
 
 mass="alle" (Standard) erklärt Gesamt- (TU), aleatorische (AU) und epistemische Unsicherheit (EU)
 getrennt; mass="total" / "aleatoric" / "epistemic" erklärt nur eine davon.
+interaktionen=True schaltet zusätzlich die Interaktionen zwischen Feldpaaren (k-SII, Ordnung 2) ein.
 
 Ablauf (wie im Projektleitfaden):
-    1. probly macht VGG16 unsicherheitsbewusst (Dropout oder Ensemble)
+    1. probly macht VGG16 unsicherheitsbewusst (Dropout, DropConnect oder Ensemble)
     2. Das Bild wird in raster x raster Felder geteilt, die Felder sind die Spieler
     3. Fehlende Felder werden ersetzt (mean, gray, black oder blur)
     4. probly bewertet jede Bildvariante: P(Zielklasse) und Unsicherheit (TU, AU und EU)
@@ -19,19 +20,24 @@ Ablauf (wie im Projektleitfaden):
 Schnelltest ohne VGG16-Download:  python image_uncertainty.py
 """
 
+import copy
+from itertools import combinations
+
 import numpy as np
 import torch
+from torch import nn
 import matplotlib.pyplot as plt
 from PIL import Image, ImageFilter
 
 import shapiq
-from shapiq.approximator import KernelSHAP
-from probly.method import dropout, ensemble
+from shapiq.approximator import KernelSHAP, KernelSHAPIQ
+from probly.method import dropconnect, dropout, ensemble
 from probly.representer import representer
 from probly.quantification import quantify
 
 MITTEL, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]     # ImageNet-Normalisierung
 SPALTE = {"total": 1, "aleatoric": 2, "epistemic": 3}           # Spalte 0 ist P(Klasse)
+METHODEN = ("dropout", "dropconnect", "ensemble")
 
 
 # =====================================================================================
@@ -43,10 +49,10 @@ class UnsicherheitsSpiel(shapiq.Game):
     bild:      Pfad oder PIL-Bild
     modell:    torch-Klassifikator (z. B. VGG16, Bild (B,3,224,224) -> Logits) oder bei
                methode="ensemble" eine Liste trainierter Mitglieder
-    methode:   "dropout" oder "ensemble"
+    methode:   "dropout", "dropconnect" oder "ensemble"
     raster:    Felder pro Zeile und Spalte (3 = 9 Spieler)
     samples:   Dropout: Anzahl Durchläufe. Ensemble: Anzahl Mitglieder (bei einem einzelnen Modell)
-    p:         Anteil ausgeschalteter Neuronen bei Dropout
+    p:         Dropout: Anteil ausgeschalteter Neuronen. DropConnect: Anteil ausgeschalteter Gewichte
     mass:      "total", "aleatoric" oder "epistemic"
     klasse:    Index der erklärten Klasse, None = wahrscheinlichste
     ersetzung: "mean", "gray", "black" oder "blur"
@@ -57,8 +63,8 @@ class UnsicherheitsSpiel(shapiq.Game):
 
     def __init__(self, bild, modell, methode="dropout", raster=3, samples=5, p=0.2, mass="total",
                  klasse=None, ersetzung="mean", stoerung=0.0, seed=0, batch=16):
-        if methode not in ("dropout", "ensemble"):
-            raise ValueError("methode muss 'dropout' oder 'ensemble' sein")
+        if methode not in METHODEN:
+            raise ValueError("methode muss 'dropout', 'dropconnect' oder 'ensemble' sein")
         if mass not in SPALTE:
             raise ValueError("mass muss 'total', 'aleatoric' oder 'epistemic' sein")
         mitglieder = list(modell) if isinstance(modell, (list, tuple)) else None
@@ -96,6 +102,10 @@ class UnsicherheitsSpiel(shapiq.Game):
         self.modell = modelle[0]
         if methode == "dropout":
             gedroppt = dropout(modelle[0], p=p, predictor_type="logit_classifier")
+            self.rep = representer(gedroppt, num_samples=samples)
+        elif methode == "dropconnect":
+            # Eigene Dropout-Schichten von VGG16 entfernen, sonst bleiben sie beim Ziehen der Stichproben aktiv
+            gedroppt = dropconnect(_ohne_dropout(modelle[0]), p=p, predictor_type="logit_classifier")
             self.rep = representer(gedroppt, num_samples=samples)
         else:
             n = len(modelle) if mitglieder else samples
@@ -147,7 +157,8 @@ class UnsicherheitsSpiel(shapiq.Game):
             weg = ~z[self.felder]
             bilder[i][weg] = self.ersatz[weg]
         # Dropout: ein Bild pro Durchgang, damit jede Koalition dieselben Masken sieht.
-        # Ensemble: Batches fester Größe (aufgefüllt), damit die Werte nicht vom Batch abhängen.
+        # DropConnect (eine Maske pro Gewichtsmatrix, für alle Bilder gleich) und Ensemble:
+        # Batches fester Größe (aufgefüllt), damit die Werte nicht vom Batch abhängen.
         groesse = 1 if self.methode == "dropout" else self.batch
         zeilen = []
         for start in range(0, len(bilder), groesse):
@@ -183,6 +194,20 @@ def _lade_vgg():
     return _cache_vgg["vgg"]
 
 
+def _ohne_dropout(modell):
+    """Kopie des Modells, bei der alle nn.Dropout-Schichten durch nn.Identity ersetzt sind.
+
+    VGG16 hat zwei eigene Dropout-Schichten (p = 0.5). probly schaltet beim Ziehen der Stichproben den
+    Trainingsmodus an, und dann würden diese mitzufallen. Für reines DropConnect werden sie entfernt.
+    """
+    kopie = copy.deepcopy(modell)
+    for eltern in kopie.modules():
+        for name, kind in list(eltern.named_children()):
+            if isinstance(kind, nn.Dropout):
+                setattr(eltern, name, nn.Identity())
+    return kopie
+
+
 def _shapley(spiel, n_spieler, budget):
     """Shapley-Werte: exakt bei bis zu 10 Feldern, sonst KernelSHAP-Näherung mit Budget."""
     if n_spieler <= 10:
@@ -200,31 +225,34 @@ KURZ = {"total": "TU", "aleatoric": "AU", "epistemic": "EU"}
 
 
 def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, mass="alle",
-                          budget=1024, ziel=None, ersetzung="mean", seed=0, stoerung=0.1, plot=True):
+                          budget=1024, ziel=None, ersetzung="mean", seed=0, stoerung=0.1, plot=True, interaktionen=False):
     """Erklärt mit shapiq, welche Bildfelder VGG16 unsicher machen.
 
     bild:      Pfad zum Bild
-    methode:   "dropout", "ensemble" oder "beide"
+    methode:   "dropout", "dropconnect", "ensemble", "beide" (Dropout und Ensemble)
+               oder "alle" (Dropout, DropConnect und Ensemble)
     raster:    Felder pro Zeile und Spalte (3 = 9 Felder, 4 = 16 Felder)
-    samples:   Dropout: Anzahl Durchläufe pro Bildvariante. Ensemble: Anzahl Mitglieder
-    p:         Anteil ausgeschalteter Neuronen bei Dropout (0.2 = 20 %)
+    samples:   Dropout/DropConnect: Anzahl Durchläufe pro Bildvariante. Ensemble: Anzahl Mitglieder
+    p:         Dropout: Anteil ausgeschalteter Neuronen. DropConnect: Anteil ausgeschalteter Gewichte (0.2 = 20 %)
     mass:      "alle" (Standard: TU, AU und EU getrennt erklären), "total", "aleatoric" oder "epistemic"
     budget:    Anzahl Kombinationen bei der Näherung (nur bei mehr als 10 Feldern)
     ziel:      Klassenname (Teilstring) oder None = wahrscheinlichste Klasse
     ersetzung: "mean", "gray" (oder "grau"), "black" oder "blur"
     seed:      fester Seed für Dropout-Masken und Ensemble-Rauschen
     stoerung:  Ensemble: Platzhalter-Rauschen der Mitglieder (siehe UnsicherheitsSpiel)
+    interaktionen: False = aus (Standard), True = zusätzlich Interaktionen zwischen je zwei Feldern (k-SII).
+               Bis 10 Felder exakt und ohne zusätzliche Modellrechnung, darüber Näherung mit dem budget.
 
     Gibt ein Dictionary {methode: {...}} zurück. Die Shapley-Werte pro Unsicherheitsart stehen unter
     "werte" (z. B. ergebnisse["dropout"]["werte"]["epistemic"]).
     Mit mass="alle" kostet die Zerlegung keine zusätzliche Modellrechnung: TU, AU und EU kommen aus
     denselben Auswertungen (Zwischenspeicher).
     """
-    if methode not in ("dropout", "ensemble", "beide"):
-        raise ValueError("methode muss 'dropout', 'ensemble' oder 'beide' sein")
+    if methode not in METHODEN + ("beide", "alle"):
+        raise ValueError("methode muss 'dropout', 'dropconnect', 'ensemble', 'beide' oder 'alle' sein")
     if mass != "alle" and mass not in SPALTE:
         raise ValueError("mass muss 'alle', 'total', 'aleatoric' oder 'epistemic' sein")
-    methoden = ["dropout", "ensemble"] if methode == "beide" else [methode]
+    methoden = {"beide": ["dropout", "ensemble"], "alle": list(METHODEN)}.get(methode, [methode])
     arten = list(SPALTE) if mass == "alle" else [mass]
 
     vgg, klassen = _lade_vgg()
@@ -248,7 +276,7 @@ def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, m
             print(f"\nErklärte Klasse: {klassen[spiel.klasse]}  (P = {spiel.wahrsch[spiel.klasse]:.3f})")
 
         print(f"\n{'=' * 60}\nMethode: {name}   (Raster {N}x{N}, samples={samples}"
-              + (f", p={p}" if name == "dropout" else "") + f", Unsicherheit={mass})\n{'=' * 60}")
+              + (f", p={p}" if name in ("dropout", "dropconnect") else "") + f", Unsicherheit={mass})\n{'=' * 60}")
 
         werte_p, basis_p = _shapley(spiel.class_probability, N * N, budget)     # der langsame Teil
         werte, basis = {}, {}
@@ -280,21 +308,89 @@ def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, m
             print("Felder, die vor allem EU treiben (fehlendes Wissen):",
                   [i for i in range(N * N) if eu[i] > 0 and eu[i] > au[i]])
 
+        inter = {}
+        if interaktionen:
+            for art in arten:
+                inter[art] = _interaktionen(lambda z, a=art: spiel.unsicherheit(z, a), N * N, budget)
+                _drucke_interaktionen(art, mass, inter[art], U_voll[art], N)
+
         if plot:
             if mass == "alle":
                 _zeichne_alle(Image.fromarray(spiel.bild), klassen[spiel.klasse], name, N, werte_p, werte, P_voll, U_voll)
             else:
                 _zeichne(Image.fromarray(spiel.bild), klassen[spiel.klasse], name, mass, N, werte_p, werte[mass],
                          P_voll, U_voll[mass])
+            if interaktionen:
+                _zeichne_interaktionen(Image.fromarray(spiel.bild), name, N, inter)
         ergebnisse[name] = {"werte_p": werte_p, "basis_p": basis_p, "P_voll": P_voll, "werte": werte, "basis": basis,
                             "voll": U_voll, "werte_u": werte[arten[0]], "basis_u": basis[arten[0]],
-                            "U_voll": U_voll[arten[0]], "spiel": spiel}
+                            "U_voll": U_voll[arten[0]], "interaktionen": inter, "spiel": spiel}
 
-    if len(methoden) == 2:
+    for m1, m2 in combinations(methoden, 2):
         for art in arten:
-            a, b = ergebnisse["dropout"]["werte"][art], ergebnisse["ensemble"]["werte"][art]
-            print(f"\nVergleich Dropout gegen Ensemble: Korrelation der Beiträge zur {KURZ[art]} {np.corrcoef(a, b)[0, 1]:+.3f}")
+            a, b = ergebnisse[m1]["werte"][art], ergebnisse[m2]["werte"][art]
+            print(f"\nVergleich {m1.capitalize()} gegen {m2.capitalize()}: "
+                  f"Korrelation der Beiträge zur {KURZ[art]} {np.corrcoef(a, b)[0, 1]:+.3f}")
     return ergebnisse
+
+
+def _interaktionen(spiel, n_spieler, budget):
+    """k-SII der Ordnung 2: Einzelbeitrag je Feld und Zusammenspiel je Feldpaar.
+
+    Bis 10 Felder exakt (alle Kombinationen liegen schon im Zwischenspeicher), sonst KernelSHAPIQ mit Budget.
+    Gibt (einzel, paare, basis) zurück; paare ist eine symmetrische Matrix (Diagonale 0).
+    """
+    if n_spieler <= 10:
+        iv = shapiq.ExactComputer(game=spiel, n_players=n_spieler)(index="k-SII", order=2)
+    else:
+        iv = KernelSHAPIQ(n=n_spieler, max_order=2, index="k-SII", random_state=0).approximate(budget=budget, game=spiel)
+    einzel = np.array([iv.dict_values.get((i,), 0.0) for i in range(n_spieler)])
+    paare = np.zeros((n_spieler, n_spieler))
+    for i in range(n_spieler):
+        for j in range(i + 1, n_spieler):
+            paare[i, j] = paare[j, i] = iv.dict_values.get((i, j), 0.0)
+    return einzel, paare, iv.dict_values.get((), 0.0)
+
+
+def _staerkste_paare(paare, anzahl=5):
+    i, j = np.triu_indices(len(paare), 1)
+    return [(int(i[k]), int(j[k]), paare[i[k], j[k]]) for k in np.argsort(-np.abs(paare[i, j]))[:anzahl]]
+
+
+def _drucke_interaktionen(art, mass, ergebnis, voll, N):
+    einzel, paare, basis = ergebnis
+    summe_paare = np.triu(paare, 1).sum()
+    titel = TITEL[art] if mass == "alle" else f"UNSICHERHEIT ({mass})"
+    print(f"\n=== Interaktionen (k-SII, Ordnung 2) zur {titel} ===")
+    print("Einzelbeiträge der Felder (ohne Zusammenspiel):")
+    print(np.round(einzel.reshape(N, N), 4))
+    print(f"Basis {basis:.5f} + Einzel {einzel.sum():.5f} + Paare {summe_paare:.5f} "
+          f"= {basis + einzel.sum() + summe_paare:.5f}   (ganzes Bild: {voll:.5f})")
+    print("Stärkste Paare:")
+    for a, b, w in _staerkste_paare(paare):
+        print(f"  Felder {a:2d} und {b:2d}: {w:+.5f}  "
+              + ("(zusammen mehr Unsicherheit als einzeln)" if w > 0 else "(ähnliche Information, redundant)"))
+
+
+def _zeichne_interaktionen(bild, name, N, inter):
+    """Oben: Matrix aller Feldpaare. Unten: die stärksten Paare als Linien im Bild (rot = verstärkt, blau = redundant)."""
+    arten = list(inter)
+    fig, axes = plt.subplots(2, len(arten), figsize=(5.5 * len(arten), 10), squeeze=False)
+    for spalte, art in enumerate(arten):
+        _, paare, _ = inter[art]
+        g = max(np.abs(paare).max(), 1e-12)
+        ax = axes[0, spalte]
+        im = ax.imshow(paare, cmap="RdBu_r", vmin=-g, vmax=g)
+        ax.set_title(f"Interaktionen {KURZ[art]} [{name}]"); ax.set_xlabel("Feld"); ax.set_ylabel("Feld")
+        fig.colorbar(im, ax=ax, fraction=0.046)
+        ax = axes[1, spalte]
+        ax.imshow(bild); ax.axis("off")
+        mitte = lambda f: ((f % N + 0.5) * 224 / N, (f // N + 0.5) * 224 / N)
+        for a, b, w in _staerkste_paare(paare):
+            (x1, y1), (x2, y2) = mitte(a), mitte(b)
+            ax.plot([x1, x2], [y1, y2], color="red" if w > 0 else "blue", lw=1 + 5 * abs(w) / g, alpha=0.8)
+        ax.set_title(f"Stärkste Paare ({KURZ[art]})\nrot = zusammen mehr, blau = redundant", fontsize=10)
+    plt.tight_layout(); plt.show()
 
 
 def _karte(fig, ax, karte, titel, fmt, N, g):
@@ -366,8 +462,6 @@ def _zeichne(bild, klasse, name, mass, N, werte_p, werte_u, P_voll, U_voll):
 # =====================================================================================
 def selbsttest():
     """Prüft TU = AU + EU, identische Mitglieder (EU = 0), Effizienz und Reihenfolge-Unabhängigkeit."""
-    from torch import nn
-
     def netz(seed):
         torch.manual_seed(seed)
         return nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(),
@@ -375,7 +469,7 @@ def selbsttest():
 
     bild = Image.fromarray(np.random.default_rng(0).integers(0, 255, (64, 80, 3), dtype=np.uint8))
     alle = np.array([[i >> k & 1 for k in range(4)] for i in range(16)], dtype=bool)   # alle 16 Koalitionen
-    for methode in ("dropout", "ensemble"):
+    for methode in METHODEN:
         w = {m: UnsicherheitsSpiel(bild, netz(0), methode, raster=2, samples=4, mass=m, stoerung=0.5)(alle) for m in SPALTE}
         assert np.allclose(w["total"], w["aleatoric"] + w["epistemic"], atol=1e-5), "TU != AU + EU"
         spiel = UnsicherheitsSpiel(bild, netz(0), methode, raster=2, samples=4, stoerung=0.5)
@@ -386,12 +480,23 @@ def selbsttest():
                for m in SPALTE}
         w3 = {m: np.array([v.dict_values.get((i,), 0.0) for i in range(4)]) for m, v in sv3.items()}
         assert np.allclose(w3["total"], w3["aleatoric"] + w3["epistemic"], atol=1e-5), "Shapley TU != AU + EU"
+        for m in SPALTE:                                    # Interaktionen: Basis + Einzel + Paare = ganzes Bild
+            einzel, paare, basis = _interaktionen(lambda z, m=m: spiel.unsicherheit(z, m), 4, 0)
+            ganz = spiel.unsicherheit(alle[-1:], m)[0]
+            assert np.isclose(basis + einzel.sum() + np.triu(paare, 1).sum(), ganz, atol=1e-5), "k-SII Effizienz verletzt"
         reihenfolge = np.random.default_rng(0).permutation(16)
         assert np.allclose(spiel(alle[reihenfolge]), spiel(alle)[reihenfolge], atol=1e-6), "Wert hängt von der Reihenfolge ab"
-        print(f"{methode}: TU = AU + EU (Werte und Shapley-Werte), Effizienz und Reihenfolge-Unabhängigkeit ok")
+        print(f"{methode}: TU = AU + EU (Werte und Shapley-Werte), Effizienz, Interaktionen und Reihenfolge-Unabhängigkeit ok")
     eu = UnsicherheitsSpiel(bild, netz(0), "ensemble", raster=2, samples=4, mass="epistemic", stoerung=0.0)(alle)
     assert np.allclose(eu, 0, atol=1e-6), "Identische Mitglieder müssen EU = 0 haben"
     print("identische Ensemble-Mitglieder: EU = 0 ok")
+    # DropConnect mit p = 0 ändert nichts, auch wenn das Modell eigene Dropout-Schichten hat (werden entfernt)
+    torch.manual_seed(0)
+    mit_dropout = nn.Sequential(nn.Conv2d(3, 8, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d(4), nn.Flatten(),
+                                nn.Linear(128, 32), nn.ReLU(), nn.Dropout(0.5), nn.Linear(32, 10)).eval()
+    eu = UnsicherheitsSpiel(bild, mit_dropout, "dropconnect", raster=2, samples=4, p=0.0, mass="epistemic")(alle)
+    assert np.allclose(eu, 0, atol=1e-6), "DropConnect mit p = 0 muss EU = 0 haben"
+    print("DropConnect mit p = 0: EU = 0 ok (eigene Dropout-Schichten entfernt)")
 
 
 if __name__ == "__main__":
