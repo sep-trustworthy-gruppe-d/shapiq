@@ -225,7 +225,8 @@ KURZ = {"total": "TU", "aleatoric": "AU", "epistemic": "EU"}
 
 
 def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, mass="alle",
-                          budget=1024, ziel=None, ersetzung="mean", seed=0, stoerung=0.1, plot=True, interaktionen=False):
+                          budget=1024, ziel=None, ersetzung="mean", seed=0, stoerung=0.1, plot=True, interaktionen=False,
+                          top_paare=5):
     """Erklärt mit shapiq, welche Bildfelder VGG16 unsicher machen.
 
     bild:      Pfad zum Bild
@@ -242,6 +243,7 @@ def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, m
     stoerung:  Ensemble: Platzhalter-Rauschen der Mitglieder (siehe UnsicherheitsSpiel)
     interaktionen: False = aus (Standard), True = zusätzlich Interaktionen zwischen je zwei Feldern (k-SII).
                Bis 10 Felder exakt und ohne zusätzliche Modellrechnung, darüber Näherung mit dem budget.
+    top_paare: Wie viele der stärksten Feldpaare ausgegeben und im Bild eingezeichnet werden (Standard 5)
 
     Gibt ein Dictionary {methode: {...}} zurück. Die Shapley-Werte pro Unsicherheitsart stehen unter
     "werte" (z. B. ergebnisse["dropout"]["werte"]["epistemic"]).
@@ -312,7 +314,7 @@ def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, m
         if interaktionen:
             for art in arten:
                 inter[art] = _interaktionen(lambda z, a=art: spiel.unsicherheit(z, a), N * N, budget)
-                _drucke_interaktionen(art, mass, inter[art], U_voll[art], N)
+                _drucke_interaktionen(art, mass, inter[art], U_voll[art], N, top_paare)
 
         if plot:
             if mass == "alle":
@@ -321,7 +323,7 @@ def erklaere_unsicherheit(bild, methode="dropout", raster=3, samples=5, p=0.2, m
                 _zeichne(Image.fromarray(spiel.bild), klassen[spiel.klasse], name, mass, N, werte_p, werte[mass],
                          P_voll, U_voll[mass])
             if interaktionen:
-                _zeichne_interaktionen(Image.fromarray(spiel.bild), name, N, inter)
+                _zeichne_interaktionen(Image.fromarray(spiel.bild), name, N, inter, top_paare)
         ergebnisse[name] = {"werte_p": werte_p, "basis_p": basis_p, "P_voll": P_voll, "werte": werte, "basis": basis,
                             "voll": U_voll, "werte_u": werte[arten[0]], "basis_u": basis[arten[0]],
                             "U_voll": U_voll[arten[0]], "interaktionen": inter, "spiel": spiel}
@@ -357,7 +359,7 @@ def _staerkste_paare(paare, anzahl=5):
     return [(int(i[k]), int(j[k]), paare[i[k], j[k]]) for k in np.argsort(-np.abs(paare[i, j]))[:anzahl]]
 
 
-def _drucke_interaktionen(art, mass, ergebnis, voll, N):
+def _drucke_interaktionen(art, mass, ergebnis, voll, N, top_paare=5):
     einzel, paare, basis = ergebnis
     summe_paare = np.triu(paare, 1).sum()
     titel = TITEL[art] if mass == "alle" else f"UNSICHERHEIT ({mass})"
@@ -366,13 +368,13 @@ def _drucke_interaktionen(art, mass, ergebnis, voll, N):
     print(np.round(einzel.reshape(N, N), 4))
     print(f"Basis {basis:.5f} + Einzel {einzel.sum():.5f} + Paare {summe_paare:.5f} "
           f"= {basis + einzel.sum() + summe_paare:.5f}   (ganzes Bild: {voll:.5f})")
-    print("Stärkste Paare:")
-    for a, b, w in _staerkste_paare(paare):
-        print(f"  Felder {a:2d} und {b:2d}: {w:+.5f}  "
+    print(f"Stärkste {top_paare} Paare (Feld = Zeile*{N} + Spalte, Zeile und Spalte zählen ab 0):")
+    for rang, (a, b, w) in enumerate(_staerkste_paare(paare, top_paare), 1):
+        print(f"  {rang:2d}. Feld {a:2d} (Z{a // N}/S{a % N}) und Feld {b:2d} (Z{b // N}/S{b % N}): {w:+.5f}  "
               + ("(zusammen mehr Unsicherheit als einzeln)" if w > 0 else "(ähnliche Information, redundant)"))
 
 
-def _zeichne_interaktionen(bild, name, N, inter):
+def _zeichne_interaktionen(bild, name, N, inter, top_paare=5):
     """Oben: Matrix aller Feldpaare. Unten: die stärksten Paare als Linien im Bild (rot = verstärkt, blau = redundant)."""
     arten = list(inter)
     fig, axes = plt.subplots(2, len(arten), figsize=(5.5 * len(arten), 10), squeeze=False)
@@ -386,7 +388,7 @@ def _zeichne_interaktionen(bild, name, N, inter):
         ax = axes[1, spalte]
         ax.imshow(bild); ax.axis("off")
         mitte = lambda f: ((f % N + 0.5) * 224 / N, (f // N + 0.5) * 224 / N)
-        for a, b, w in _staerkste_paare(paare):
+        for a, b, w in _staerkste_paare(paare, top_paare):
             (x1, y1), (x2, y2) = mitte(a), mitte(b)
             ax.plot([x1, x2], [y1, y2], color="red" if w > 0 else "blue", lw=1 + 5 * abs(w) / g, alpha=0.8)
         ax.set_title(f"Stärkste Paare ({KURZ[art]})\nrot = zusammen mehr, blau = redundant", fontsize=10)

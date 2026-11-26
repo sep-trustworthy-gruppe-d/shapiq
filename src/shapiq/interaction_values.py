@@ -965,6 +965,28 @@ class InteractionValues:
 
         return stacked_bar_plot(self, show=show, **kwargs)
 
+    def plot_image(
+        self, image: np.ndarray, *, show: bool = True, **kwargs: Any
+    ) -> tuple[Figure, tuple[Axes, Axes]] | None:
+        """Visualize the InteractionValues of image regions on the image.
+
+        For arguments, see :func:`shapiq.plot.image.image_plot`.
+
+        Args:
+            image: The explained image.
+            show: Whether to show the plot. Defaults to ``True``.
+            **kwargs: Additional keyword arguments to pass to the plotting function, e.g. ``grid``
+                or ``regions`` for the layout of the players on the image.
+
+        Returns:
+            If show is ``False``, the function returns a tuple with the figure and the two axes of
+                the plot.
+
+        """
+        from .plot import image_plot
+
+        return image_plot(self, image, show=show, **kwargs)
+
     def plot_force(
         self,
         feature_names: np.ndarray | None = None,
